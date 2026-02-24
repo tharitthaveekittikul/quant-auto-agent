@@ -1,0 +1,27 @@
+version: "3.8"
+
+services:
+  questdb:
+    image: questdb/questdb:latest
+    container_name: questdb
+    restart: always
+    ports:
+      - "9000:9000" # Web Console
+      - "8812:8812" # Postgres Wire Protocol
+      - "9009:9009" # InfluxDB Line Protocol (fast transfer data)
+    volumes:
+      - questdb_data:/var/lib/questdb
+
+  redis:
+    image: redis:alpine
+    container_name: redis_state
+    restart: always
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+volumes:
+  questdb_data:
+  redis_data:
