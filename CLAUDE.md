@@ -22,7 +22,7 @@ uv add <package>
 
 **Infrastructure** (requires Docker):
 ```bash
-# Start QuestDB and Redis
+# Start QuestDB and Redis Stack
 docker-compose up -d
 
 # Stop
@@ -31,7 +31,7 @@ docker-compose down
 
 ## Architecture
 
-This is a **quantitative trading AI agent** that connects to the Topstep/ProjectX broker, processes real-time market data, and makes AI-driven trading decisions.
+This is a **quantitative trading AI agent** built on LangGraph. It streams real-time market data from Alpaca (or ProjectX/TopstepX), computes technical indicators, and runs a stateful AI decision-making loop that can place trades automatically.
 
 ### Data Flow
 
@@ -40,26 +40,103 @@ This is a **quantitative trading AI agent** that connects to the Topstep/Project
                     │                                              │
                     └─ adapters/alpaca/market_stream.py (WSS) ────┴──→ QuestDB (ILP, port 9009)
                                                                                ↓
-                                                                  agents/nodes/market_reader.py
+                                                            agents/nodes/market_reader.py
+                                                            (QuestDB OHLCV query + REST fallback
+                                                             + utils/indicators.py signals
+                                                             + broker portfolio fetch)
                                                                                ↓
-                                                                  agents/nodes/brain.py ←→ LLM
+                                                            agents/nodes/brain.py ←→ LLM (Claude/GPT/Gemini)
+                                                            (structured TradingDecision output)
                                                                                ↓
-                                                                  agents/nodes/guardrail.py
+                                                            agents/nodes/guardrail.py
+                                                            (pure Python risk rules, no LLM)
                                                                                ↓
-              adapters/projectx/user_hub.py  ←── order/fill events ──── SQLite (shared/database.py)
-              adapters/alpaca/trade_stream.py                                  ↓
-                                                                  adapters/telegram_bot.py → Telegram
+                                          ┌──────────────── route_after_guardrail() ───────────────┐
+                                          │ is_risk_passed=True, action∈{BUY,SELL}                 │ HOLD or fail
+                                          ↓                                                        ↓
+                            agents/nodes/execution.py                                             END
+                            (broker order + SQLite log)
+                                          ↓
+              adapters/alpaca/client.py  ←── order result
+              adapters/projectx/client.py
+                                          ↓
+                                   shared/database.py → SQLite (TradeOrder log)
 ```
 
 ### Key Directories
 
+- **`main.py`** — Async entry point. Starts market stream, asyncpg pool, Redis checkpointer, runs the LangGraph cycle every 5 minutes.
+- **`core/`** — `graph.py` (LangGraph factory), `state.py` (`AgentState` TypedDict + `TradingDecision` Pydantic), `constants.py` (all thresholds and env var names).
+- **`agents/nodes/`** — Four LangGraph nodes: `market_reader.py`, `brain.py`, `guardrail.py`, `execution.py`.
 - **`adapters/projectx/`** — ProjectX Gateway API client (SignalR + REST). For demo (s2f) and production TopstepX.
-- **`adapters/alpaca/`** — Alpaca Markets paper trading client (WebSocket + REST via alpaca-py SDK). Free alternative for testing without a paid account.
-- **`agents/nodes/`** — LangGraph agent nodes: `brain.py` (LLM decision making), `guardrail.py` (risk enforcement), `market_reader.py` (data preprocessing).
-- **`core/`** — LangGraph graph definition (`graph.py`), shared agent state schema (`state.py`), and system-wide constants (`constants.py`).
-- **`shared/`** — Database layer. `database.py` manages SQLite (SQLModel ORM) and QuestDB (InfluxDB Line Protocol). `models.py` defines `AccountState`, `TradeOrder`, `TradeLog` SQLModel tables and the schema-less `MarketTick` (QuestDB).
-- **`utils/`** — `logger.py` (Loguru), `indicators.py` (technical indicators with numpy/pandas).
+- **`adapters/alpaca/`** — Alpaca Markets paper trading client (WebSocket + REST via alpaca-py SDK).
+- **`shared/`** — `database.py` (SQLite + QuestDB ILP helpers), `models.py` (`AccountState`, `TradeOrder`, `TradeLog` SQLModel tables).
+- **`utils/`** — `logger.py` (Loguru setup), `llm.py` (`get_llm()` multi-provider factory), `indicators.py` (SMA/EMA/RSI/MACD/BB + `compute_all()`).
 - **`research_lab/experiments/`** — Scratch space for strategy experimentation.
+
+### LangGraph State Machine
+
+Graph defined in `core/graph.py` via `create_graph(checkpointer, db_pool, broker_client)`.
+
+```
+START → market_reader → brain → guardrail
+guardrail --[risk_passed + BUY/SELL]--> execution → END
+guardrail --[HOLD or risk fail]---------> END
+```
+
+**State** (`core/state.py` `AgentState`):
+
+| Field | Set by | Type |
+|-------|--------|------|
+| `symbol`, `broker`, `account_id` | caller (initial state) | identity |
+| `market_data`, `signals`, `portfolio` | `market_reader` | market context |
+| `decision` | `brain` | `TradingDecision.model_dump()` |
+| `is_risk_passed`, `risk_reason` | `guardrail` | risk verdict |
+| `order_result` | `execution` | broker response |
+| `messages` | `brain` + `execution` | LangChain message history (auto-appended) |
+| `error` | `market_reader` | error string or None |
+
+State is **persisted in Redis** via `AsyncRedisSaver` — the graph resumes from the last checkpoint on restart using `thread_id = "trading-{broker}-{symbol}"`.
+
+### Agent Nodes
+
+| Node | File | Key function | LLM? |
+|------|------|-------------|------|
+| `market_reader` | `agents/nodes/market_reader.py` | `market_reader(state, *, db_pool, broker_client)` | No |
+| `brain` | `agents/nodes/brain.py` | `brain(state)` | Yes |
+| `guardrail` | `agents/nodes/guardrail.py` | `guardrail(state)` | No |
+| `execution` | `agents/nodes/execution.py` | `execution(state, *, broker_client)` | No |
+
+**market_reader** queries QuestDB via asyncpg (Postgres wire port 8812):
+```sql
+SELECT timestamp, first(last) o, max(last) h, min(last) l, last(last) c,
+       sum(volume) v, last(bid) bid, last(ask) ask
+FROM market_data WHERE symbol=$1 AND last>0
+AND timestamp >= dateadd('h', -24, now())
+SAMPLE BY 5m ALIGN TO CALENDAR ORDER BY timestamp ASC LIMIT 100
+```
+Falls back to broker REST bars if QuestDB has < 60 bars.
+
+**brain** calls `get_llm("BRAIN_MODEL", "claude-opus-4-6")` with structured output (`TradingDecision`). Supports Claude, GPT, Gemini — detected by model name prefix.
+
+**guardrail** checks (first failure wins):
+1. Decision exists
+2. Confidence ≥ 0.65
+3. Daily P&L ≥ −2% of equity
+4. Drawdown ≤ 5%
+5. Target price within 2% of current price
+6. Position size ≤ 10% of equity
+
+### Utils
+
+**`utils/llm.py` — `get_llm(env_var, default)`**
+- `claude-*` → `ChatAnthropic`
+- `gpt-*` / `o1-*` / `o3-*` / `o4-*` → `ChatOpenAI`
+- `gemini-*` → `ChatGoogleGenerativeAI`
+- All instantiated with `temperature=0.0`
+
+**`utils/indicators.py` — `compute_all(bars) → dict`**
+Returns: `sma_20`, `sma_50`, `ema_12`, `ema_26`, `rsi_14`, `macd_line`, `macd_signal`, `macd_histogram`, `bb_upper`, `bb_middle`, `bb_lower`, `current_price`, `spread`, `volume_24h`
 
 ### adapters/projectx/ — ProjectX Client
 
@@ -81,8 +158,6 @@ This is a **quantitative trading AI agent** that connects to the Topstep/Project
 
 **Auth flow:** POST `/api/Auth/loginKey` → JWT token → pass as `Bearer` on REST + `access_token_factory` for SignalR. Call `/api/Auth/validate` every 23h to refresh.
 
-**SignalR** uses `signalrcore` (thread-based). Callbacks run in the SignalR thread; bridge to async with `asyncio.run_coroutine_threadsafe(coro, main_loop)`.
-
 **Quick start:**
 ```python
 client = await ProjectXClient.from_env()           # reads PROJECTX_ENV/USERNAME/API_KEY
@@ -97,22 +172,13 @@ Free alternative using Alpaca Markets paper trading ($100k simulated cash, no ac
 
 | File | Purpose |
 |------|---------|
-| `config.py` | `Environment` enum (PAPER/LIVE) and feed config (`iex`=free/`sip`=paid) |
+| `config.py` | `Environment` enum (PAPER/LIVE); `data_feed: DataFeed` (IEX=free/SIP=paid) |
 | `rest_client.py` | `RestClient` — async wrapper around alpaca-py `TradingClient` (orders, positions, account) |
 | `market_stream.py` | `MarketStream` — WebSocket quotes + trades → QuestDB; wraps `StockDataStream` |
 | `trade_stream.py` | `TradeStream` — order fill events; wraps `TradingStream` |
 | `client.py` | `AlpacaClient` — unified facade |
 
-**Environment URLs:**
-
-| | REST API | Market Data Stream |
-|---|---|---|
-| Paper | `paper-api.alpaca.markets` | `stream.data.alpaca.markets/v2/iex` (free, 30 symbol limit) |
-| Live | `api.alpaca.markets` | `stream.data.alpaca.markets/v2/sip` (paid) |
-
-**Auth:** `APCA-API-KEY-ID` + `APCA-API-SECRET-KEY` headers. Paper and live accounts have **separate** credentials.
-
-**Streams** use alpaca-py which runs its own asyncio event loop in a background thread. Bridge callbacks to the main loop with `asyncio.run_coroutine_threadsafe(coro, main_loop)`.
+**Note:** `data_feed` must be `alpaca.data.enums.DataFeed` enum (not a plain string) — `StockDataStream` calls `.value` on it internally.
 
 **Quick start:**
 ```python
@@ -128,13 +194,9 @@ await client.rest.place_limit_order("AAPL", qty=5, side="sell", limit_price=200.
 
 | Database | Purpose | Access |
 |----------|---------|--------|
-| SQLite (`data/trading.db`) | Trade orders, account state, audit logs | SQLModel ORM via `shared/database.py` |
-| QuestDB | Time-series market tick data | InfluxDB Line Protocol port 9009; web console port 9000; Postgres port 8812 |
-| Redis | LangGraph agent state persistence | `aioredis` async client |
-
-### Agent Framework
-
-**LangGraph** for graph orchestration, **LangChain** for LLM calls (both `langchain-anthropic` and `langchain-openai` available). Graph defined in `core/graph.py`, state schema in `core/state.py`, Redis for cross-restart state persistence.
+| SQLite (`data/trading.db`) | `TradeOrder`, `TradeLog`, `AccountState` | SQLModel ORM via `shared/database.py` |
+| QuestDB | Time-series tick data (`market_data` table) | ILP port 9009 (write); Postgres port 8812 (query); web console port 9000 |
+| Redis Stack | LangGraph checkpoint state (requires RedisJSON module) | `AsyncRedisSaver` via `langgraph-checkpoint-redis` |
 
 ### Environment Variables
 
@@ -148,9 +210,19 @@ ALPACA_ENV=paper           # "paper" or "live"
 ALPACA_API_KEY=
 ALPACA_SECRET_KEY=
 QUESTDB_HOST=127.0.0.1
-QUESTDB_PORT=9009
+QUESTDB_PORT=9009          # ILP write port
+QUESTDB_PG_PORT=8812       # Postgres query port (used by asyncpg)
 REDIS_URL=redis://localhost:6379
 ANTHROPIC_API_KEY=
 OPENAI_API_KEY=
+GOOGLE_API_KEY=
+BRAIN_MODEL=claude-opus-4-6   # or gpt-4o or gemini-2.0-flash
 TELEGRAM_BOT_TOKEN=
 ```
+
+### Known Behaviours
+
+- **Zero bars on startup**: Normal when market is closed or QuestDB is empty. The stream feeds QuestDB over time; the REST fallback only returns data during US market hours (9:30 AM–4 PM ET) on the IEX free feed.
+- **Redis requires redis-stack**: `langgraph-checkpoint-redis` uses the RedisJSON module. Use `redis/redis-stack:latest` in docker-compose, not `redis:alpine`.
+- **Alpaca `data_feed` must be `DataFeed` enum**: Not a plain string — `StockDataStream` calls `.value` on it.
+- **Thread bridging**: Both Alpaca streams and ProjectX SignalR run in background threads. Use `asyncio.run_coroutine_threadsafe(coro, main_loop)` to bridge callbacks to the async main loop.

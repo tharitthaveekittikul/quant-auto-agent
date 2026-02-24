@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 from enum import Enum
 
+from alpaca.data.enums import DataFeed
+
 
 class Environment(str, Enum):
     PAPER = "paper"
@@ -11,19 +13,19 @@ class Environment(str, Enum):
 class AlpacaConfig:
     name: str
     paper: bool
-    # "iex" = free tier (30 symbols max), "sip" = paid SIP feed, "test" = sandbox
-    data_feed: str
+    # IEX = free tier (30 symbols max), SIP = paid SIP feed
+    data_feed: DataFeed
 
 
 ALPACA_CONFIGS: dict[Environment, AlpacaConfig] = {
     Environment.PAPER: AlpacaConfig(
         name="Alpaca Paper",
         paper=True,
-        data_feed="iex",
+        data_feed=DataFeed.IEX,
     ),
     Environment.LIVE: AlpacaConfig(
         name="Alpaca Live",
         paper=False,
-        data_feed="sip",
+        data_feed=DataFeed.SIP,
     ),
 }

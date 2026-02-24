@@ -1,0 +1,168 @@
+@startuml quant_auto_agent_architecture
+
+skinparam backgroundColor #FAFAFA
+skinparam defaultFontName Helvetica
+skinparam defaultFontSize 12
+skinparam ArrowColor #555555
+skinparam NoteBackgroundColor #FFFDE7
+skinparam NoteBorderColor #F9A825
+skinparam SequenceGroupBorderColor #AAAAAA
+
+' ─────────────────────────────────────────────────────────────
+' COMPONENT COLOURS
+' ─────────────────────────────────────────────────────────────
+skinparam rectangle {
+  BackgroundColor<<entrypoint>> #E3F2FD
+  BorderColor<<entrypoint>>     #1565C0
+  BackgroundColor<<adapter>>    #E8F5E9
+  BorderColor<<adapter>>        #2E7D32
+  BackgroundColor<<node>>       #F3E5F5
+  BorderColor<<node>>           #6A1B9A
+  BackgroundColor<<util>>       #FFF3E0
+  BorderColor<<util>>           #E65100
+  BackgroundColor<<db>>         #FCE4EC
+  BorderColor<<db>>             #880E4F
+  BackgroundColor<<core>>       #E0F7FA
+  BorderColor<<core>>           #006064
+}
+
+' ─────────────────────────────────────────────────────────────
+' STARTUP / ENTRY POINT
+' ─────────────────────────────────────────────────────────────
+rectangle "<b>main.py</b>\n//async main()//\n//run_agent_cycle()//" <<entrypoint>> as MAIN
+
+' ─────────────────────────────────────────────────────────────
+' ADAPTERS
+' ─────────────────────────────────────────────────────────────
+package "adapters/alpaca/" {
+  rectangle "<b>client.py</b>\nAlpacaClient.from_env()\n.buy() / .sell()\n.connect_market()\n.connect_user()" <<adapter>> as ALPACA_CLIENT
+  rectangle "<b>market_stream.py</b>\nMarketStream.connect()\n_quote_handler()\n_trade_handler()" <<adapter>> as ALPACA_MARKET
+  rectangle "<b>rest_client.py</b>\nRestClient\nget_account()\nget_all_positions()\nplace_market_order()" <<adapter>> as ALPACA_REST
+  rectangle "<b>trade_stream.py</b>\nTradeStream.connect()" <<adapter>> as ALPACA_TRADE
+  rectangle "<b>config.py</b>\nAlpacaConfig\nDataFeed.IEX / SIP" <<adapter>> as ALPACA_CFG
+}
+
+package "adapters/projectx/" {
+  rectangle "<b>client.py</b>\nProjectXClient.from_env()\n.connect_market()\n.connect_user()" <<adapter>> as PX_CLIENT
+  rectangle "<b>market_hub.py</b>\nMarketHub (SignalR)\nsubscribe_quotes()" <<adapter>> as PX_MARKET
+  rectangle "<b>rest_client.py</b>\nRestClient\nplace_order()\nget_open_positions()\nsearch_accounts()" <<adapter>> as PX_REST
+  rectangle "<b>auth.py</b>\nAuthSession\nlogin() / start_token_refresh()" <<adapter>> as PX_AUTH
+}
+
+' ─────────────────────────────────────────────────────────────
+' DATABASES
+' ─────────────────────────────────────────────────────────────
+database "<b>QuestDB</b>\nport 9009 (ILP write)\nport 8812 (Postgres query)\nport 9000 (web console)\ntable: market_data" <<db>> as QUESTDB
+database "<b>SQLite</b>\ndata/trading.db\nTradeOrder\nTradeLog\nAccountState" <<db>> as SQLITE
+database "<b>Redis Stack</b>\nport 6379\nLangGraph checkpoints\n(requires RedisJSON)" <<db>> as REDIS
+
+' ─────────────────────────────────────────────────────────────
+' CORE
+' ─────────────────────────────────────────────────────────────
+package "core/" {
+  rectangle "<b>graph.py</b>\ncreate_graph()\nroute_after_guardrail()" <<core>> as GRAPH
+  rectangle "<b>state.py</b>\nAgentState (TypedDict)\nTradingDecision (Pydantic)" <<core>> as STATE
+  rectangle "<b>constants.py</b>\nSMA_SHORT=20, SMA_LONG=50\nRSI_PERIOD=14, MIN_CONFIDENCE=0.65\nMAX_DRAWDOWN_PCT=0.05\nBRAIN_MODEL_ENV" <<core>> as CONSTANTS
+}
+
+' ─────────────────────────────────────────────────────────────
+' UTILS
+' ─────────────────────────────────────────────────────────────
+package "utils/" {
+  rectangle "<b>indicators.py</b>\ncompute_all(bars)\nsma() / ema() / rsi()\nmacd() / bollinger_bands()" <<util>> as INDICATORS
+  rectangle "<b>llm.py</b>\nget_llm(env_var, default)\nclaude-* -> ChatAnthropic\ngpt-*    -> ChatOpenAI\ngemini-* -> ChatGoogleGenerativeAI" <<util>> as LLM_FACTORY
+  rectangle "<b>logger.py</b>\nsetup_logger()\nstderr + logs/{date}.log" <<util>> as LOGGER
+}
+
+' ─────────────────────────────────────────────────────────────
+' SHARED
+' ─────────────────────────────────────────────────────────────
+package "shared/" {
+  rectangle "<b>database.py</b>\ninit_db()\nsend_to_questdb()\nlog_trade_to_db()" <<db>> as DATABASE
+  rectangle "<b>models.py</b>\nTradeOrder (SQLModel)\nTradeLog (SQLModel)\nAccountState (SQLModel)" <<db>> as MODELS
+}
+
+' ─────────────────────────────────────────────────────────────
+' AGENT NODES
+' ─────────────────────────────────────────────────────────────
+package "agents/nodes/" {
+  rectangle "<b>market_reader.py</b>\nmarket_reader(state, *, db_pool, broker_client)\n- _fetch_bars_questdb()\n- _fetch_bars_alpaca()  [fallback]\n- _fetch_bars_projectx() [fallback]\n- compute_all(bars)\n- _fetch_portfolio_alpaca()\n- _fetch_portfolio_projectx()" <<node>> as MR
+
+  rectangle "<b>brain.py</b>\nbrain(state)\n- get_llm(BRAIN_MODEL_ENV)\n- llm.with_structured_output(TradingDecision)\n- builds system + human prompt\n- ainvoke(messages)" <<node>> as BRAIN
+
+  rectangle "<b>guardrail.py</b>\nguardrail(state)  [sync, no LLM]\n- confidence >= 0.65\n- daily_pnl_pct >= -2%\n- drawdown_pct <= 5%\n- price deviation <= 2%\n- position_value <= 10% equity" <<node>> as GUARD
+
+  rectangle "<b>execution.py</b>\nexecution(state, *, broker_client)\n- alpaca: buy() / sell()\n- projectx: rest.place_order()\n- log_trade_to_db()" <<node>> as EXEC
+}
+
+' ─────────────────────────────────────────────────────────────
+' LLM PROVIDERS
+' ─────────────────────────────────────────────────────────────
+cloud "LLM Providers" {
+  rectangle "Anthropic\nclaude-opus-4-6\nclaude-sonnet-4-6" as ANTHROPIC
+  rectangle "OpenAI\ngpt-4o, o1, o3, o4" as OPENAI
+  rectangle "Google\ngemini-2.0-flash" as GOOGLE
+}
+
+' ─────────────────────────────────────────────────────────────
+' CONNECTIONS — STARTUP
+' ─────────────────────────────────────────────────────────────
+MAIN --> ALPACA_CLIENT : "AlpacaClient.from_env()"
+MAIN --> QUESTDB       : "asyncpg.create_pool(port=8812)"
+MAIN --> REDIS         : "AsyncRedisSaver.from_conn_string()"
+MAIN --> GRAPH         : "create_graph(checkpointer, db_pool, client)"
+MAIN --> DATABASE      : "init_db()"
+MAIN --> LOGGER        : "setup_logger()"
+
+ALPACA_CLIENT --> ALPACA_MARKET : "connect_market(symbols)"
+ALPACA_CLIENT --> ALPACA_REST   : "rest.*"
+ALPACA_CLIENT --> ALPACA_TRADE  : "connect_user()"
+ALPACA_CLIENT --> ALPACA_CFG    : "ALPACA_CONFIGS[env]"
+
+ALPACA_MARKET --> QUESTDB : "send_to_questdb()\nILP port 9009"
+ALPACA_TRADE  ..> MAIN    : "order fill events\n(threadsafe callback)"
+
+PX_MARKET --> QUESTDB : "send_to_questdb()\nILP port 9009"
+PX_CLIENT --> PX_AUTH   : "login() / token refresh"
+PX_CLIENT --> PX_MARKET : "connect_market()"
+PX_CLIENT --> PX_REST   : "rest.*"
+
+' ─────────────────────────────────────────────────────────────
+' CONNECTIONS — LANGGRAPH GRAPH
+' ─────────────────────────────────────────────────────────────
+GRAPH --> MR    : "node: market_reader\n(partial with db_pool, broker_client)"
+GRAPH --> BRAIN : "node: brain"
+GRAPH --> GUARD : "node: guardrail"
+GRAPH --> EXEC  : "node: execution\n(partial with broker_client)"
+GRAPH --> REDIS : "checkpointer\nthread_id=trading-{broker}-{symbol}"
+GRAPH --> STATE : "AgentState schema"
+
+' ─────────────────────────────────────────────────────────────
+' CONNECTIONS — NODE INTERNALS
+' ─────────────────────────────────────────────────────────────
+MR --> QUESTDB     : "_fetch_bars_questdb()\nSAMPLE BY 5m"
+MR --> ALPACA_REST : "_fetch_bars_alpaca() [fallback]\nStockHistoricalDataClient"
+MR --> PX_REST     : "_fetch_bars_projectx() [fallback]\nget_bars()"
+MR --> INDICATORS  : "compute_all(bars)"
+MR --> ALPACA_REST : "_fetch_portfolio_alpaca()\nget_account() + get_all_positions()"
+MR --> PX_REST     : "_fetch_portfolio_projectx()\nsearch_accounts() + get_open_positions()"
+
+BRAIN --> LLM_FACTORY : "get_llm(BRAIN_MODEL_ENV)"
+BRAIN --> STATE       : "TradingDecision\nstructured output"
+LLM_FACTORY --> ANTHROPIC : "claude-*"
+LLM_FACTORY --> OPENAI    : "gpt-* / o1-* / o3-* / o4-*"
+LLM_FACTORY --> GOOGLE    : "gemini-*"
+
+GUARD --> CONSTANTS : "MIN_CONFIDENCE\nDAILY_LOSS_LIMIT_PCT\nMAX_DRAWDOWN_PCT\nMAX_PRICE_DEVIATION_PCT\nMAX_POSITION_PCT"
+
+EXEC --> ALPACA_CLIENT : "alpaca path:\nclient.buy() / .sell()"
+EXEC --> PX_REST       : "projectx path:\nrest.place_order()"
+EXEC --> DATABASE      : "log_trade_to_db()"
+
+DATABASE --> SQLITE  : "SQLModel ORM"
+DATABASE --> QUESTDB : "send_to_questdb() ILP"
+MODELS --> SQLITE    : "table definitions"
+
+INDICATORS --> CONSTANTS : "SMA_SHORT, SMA_LONG\nEMA_FAST, EMA_SLOW\nRSI_PERIOD, BB_PERIOD, BB_STD"
+
+@enduml

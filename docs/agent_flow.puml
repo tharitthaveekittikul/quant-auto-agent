@@ -1,0 +1,154 @@
+@startuml agent_flow
+
+skinparam backgroundColor #FAFAFA
+skinparam defaultFontName Helvetica
+skinparam defaultFontSize 12
+skinparam ArrowColor #444444
+skinparam ActivityBackgroundColor #FFFFFF
+skinparam ActivityBorderColor #666666
+skinparam ActivityDiamondBackgroundColor #FFF9C4
+skinparam ActivityDiamondBorderColor #F57F17
+skinparam NoteBackgroundColor #E8F5E9
+skinparam NoteBorderColor #388E3C
+skinparam PartitionBorderColor #BBBBBB
+skinparam PartitionBackgroundColor #FAFAFA
+
+title <b>quant-auto-agent</b> — LangGraph Agent Cycle\n(triggered every 5 min by <b>main.py:run_agent_cycle()</b>)
+
+start
+
+:<b>main.py</b>\n<size:10>asyncio.run(main())\nAlpacaClient.from_env()\nclient.connect_market(symbols)\nasyncpg.create_pool(port=8812)\nAsyncRedisSaver.from_conn_string()\ncreate_graph(checkpointer, db_pool, client)</size>;
+
+note right
+  <b>Startup sequence</b>
+  1. init_db()  ->  shared/database.py
+  2. Market stream starts feeding
+     QuestDB via ILP port 9009
+  3. Redis checkpointer initialised
+     (requires redis-stack image)
+  4. Loop: graph.ainvoke() every 5m
+end note
+
+partition "<b>core/graph.py</b> — create_graph()" {
+
+  partition "Node 1 — <b>agents/nodes/market_reader.py</b>\n//market_reader(state, db_pool, broker_client)//" #E3F2FD {
+
+    :Query QuestDB via asyncpg\n<size:10>_fetch_bars_questdb(db_pool, symbol)\nSELECT … FROM market_data\nSAMPLE BY 5m ALIGN TO CALENDAR\nLIMIT 100</size>;
+
+    if (bars >= 60?) then (yes)
+      :Use QuestDB bars;
+    else (no - market closed\nor stream just started)
+      :REST fallback\n<size:10>_fetch_bars_alpaca(broker_client, symbol)\nStockHistoricalDataClient.get_stock_bars()\nor\n_fetch_bars_projectx(broker_client, symbol)\nrest_client.get_bars()</size>;
+    endif
+
+    if (bars available?) then (no)
+      :Set state.error\nstate.signals = {}\nstate.market_data = [];
+    else (yes)
+      :Compute indicators\n<size:10>utils/indicators.py — compute_all(bars)\nsma_20, sma_50, ema_12, ema_26\nrsi_14, macd_line/signal/histogram\nbb_upper/middle/lower\ncurrent_price, spread, volume_24h</size>;
+
+      :Fetch portfolio\n<size:10>alpaca: rest_client.get_account()\n        rest_client.get_all_positions()\nprojectx: rest_client.search_accounts()\n          rest_client.get_open_positions()</size>;
+
+      note right
+        <b>AgentState updated:</b>
+        market_data, signals, portfolio
+      end note
+    endif
+  }
+
+  partition "Node 2 — <b>agents/nodes/brain.py</b>\n//brain(state)//" #F3E5F5 {
+
+    if (signals empty?) then (yes)
+      :Return HOLD decision\nconfidence=0.0;
+    else (no)
+      :Build prompt\n<size:10>SystemMessage: role + BUY/SELL/HOLD rules\nHumanMessage: symbol + signals JSON\n              + portfolio summary\n              + last 5 messages</size>;
+
+      :Call LLM\n<size:10>utils/llm.py — get_llm("BRAIN_MODEL", "claude-opus-4-6")\nllm.with_structured_output(TradingDecision, method="json_schema")\nawait structured_llm.ainvoke(prompt_messages)</size>;
+
+      note right
+        <b>BRAIN_MODEL env var:</b>
+        claude-*  -> ChatAnthropic
+        gpt-*     -> ChatOpenAI
+        gemini-*  -> ChatGoogleGenerativeAI
+        (all temperature=0.0)
+      end note
+
+      :Parse TradingDecision\n<size:10>core/state.py — TradingDecision (Pydantic)\naction: BUY | SELL | HOLD\nconfidence: 0.0-1.0\ntarget_price, stop_loss, take_profit\nquantity, strategy_name, reasoning</size>;
+    endif
+
+    :Append AIMessage to state.messages;
+
+    note right
+      <b>AgentState updated:</b>
+      decision, messages
+    end note
+  }
+
+  partition "Node 3 — <b>agents/nodes/guardrail.py</b>\n//guardrail(state)  [sync, no LLM]//" #FFF8E1 {
+
+    :Check risk rules in order\n<size:10>core/constants.py thresholds</size>;
+
+    if (decision is None?) then (yes)
+      :FAIL: no decision;
+    elseif (confidence < MIN_CONFIDENCE=0.65?) then (yes)
+      :FAIL: low confidence;
+    elseif (daily_pnl_pct < -DAILY_LOSS_LIMIT_PCT=2%?) then (yes)
+      :FAIL: daily loss limit;
+    elseif (drawdown_pct > MAX_DRAWDOWN_PCT=5%?) then (yes)
+      :FAIL: drawdown exceeded;
+    elseif (abs(target-current)/current > MAX_PRICE_DEVIATION=2%?) then (yes)
+      :FAIL: abnormal price;
+    elseif (qty * price > equity * MAX_POSITION_PCT=10%?) then (yes)
+      :FAIL: oversized position;
+    else (all pass)
+      :PASS;
+    endif
+
+    note right
+      <b>AgentState updated:</b>
+      is_risk_passed, risk_reason
+    end note
+  }
+
+  :route_after_guardrail(state)\n<size:10>core/graph.py</size>;
+
+  if (is_risk_passed AND (action == BUY OR action == SELL)?) then (yes)
+
+    partition "Node 4 — <b>agents/nodes/execution.py</b>\n//execution(state, broker_client)//" #E8F5E9 {
+
+      if (broker == "alpaca"?) then (yes)
+        :Place order via AlpacaClient\n<size:10>adapters/alpaca/client.py\nclient.buy(symbol, qty, order_type="market")\nclient.sell(symbol, qty, order_type="market")</size>;
+      else (projectx)
+        :Place order via ProjectX REST\n<size:10>adapters/projectx/rest_client.py\nrest.place_order(account_id, contract_id,\n  type=2 Market, side=0 Buy/1 Sell, size)</size>;
+      endif
+
+      :Log to SQLite\n<size:10>shared/database.py — log_trade_to_db()\nshared/models.py  — TradeOrder record</size>;
+
+      :Append AIMessage confirmation\nto state.messages;
+
+      note right
+        <b>AgentState updated:</b>
+        order_result, messages
+      end note
+    }
+
+  else (no - HOLD or risk failed)
+    :Skip execution -> END;
+  endif
+
+}
+
+:Cycle complete\n<size:10>main.py:run_agent_cycle() logs summary\naction | confidence | risk_passed | reason</size>;
+
+:Sleep 300s\nAwait next cycle;
+
+note right
+  <b>Redis Checkpoint (between cycles):</b>
+  AsyncRedisSaver persists full AgentState
+  key: thread_id = "trading-{broker}-{symbol}"
+  On restart: graph.ainvoke() resumes
+  from last checkpoint automatically
+end note
+
+stop
+
+@enduml
