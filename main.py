@@ -20,6 +20,7 @@ from langgraph.checkpoint.redis.aio import AsyncRedisSaver
 from loguru import logger
 
 from adapters.oanda.client import OandaClient
+from adapters.telegram_bot import TelegramNotifier
 from adapters.yfinance_client import YFinanceClient
 from core.constants import DEFAULT_REDIS_URL, PG_DATABASE, PG_HOST, PG_PASSWORD, PG_PORT, PG_USER
 from core.graph import create_graph
@@ -57,7 +58,9 @@ def _build_initial_state(symbol: str) -> dict:
 # Main loop
 # ---------------------------------------------------------------------------
 
-async def run_agent_cycle(graph, symbol: str, config: dict, broker_client) -> None:
+async def run_agent_cycle(
+    graph, symbol: str, config: dict, broker_client, notifier: TelegramNotifier | None = None
+) -> None:
     """Run one full graph invocation for a symbol."""
     logger.info(f"--- Agent cycle start: {symbol} ---")
     initial_state = _build_initial_state(symbol)
@@ -65,15 +68,49 @@ async def run_agent_cycle(graph, symbol: str, config: dict, broker_client) -> No
         result = await graph.ainvoke(initial_state, config)
         decision = result.get("decision") or {}
         risk_passed = result.get("is_risk_passed", False)
+        action = decision.get("action", "HOLD")
+        confidence = float(decision.get("confidence", 0))
         logger.info(
-            f"Cycle complete: {symbol} | action={decision.get('action', 'N/A')} | "
-            f"confidence={decision.get('confidence', 0):.2f} | "
+            f"Cycle complete: {symbol} | action={action} | "
+            f"confidence={confidence:.2f} | "
             f"risk_passed={risk_passed} | reason={result.get('risk_reason', '')}"
         )
-        if decision.get("action") != "HOLD" and decision.get("reasoning"):
+        if action != "HOLD" and decision.get("reasoning"):
             logger.info(f"Brain reasoning: {decision['reasoning'][:200]}")
+
+        # Telegram notifications
+        if notifier:
+            if risk_passed and action in ("BUY", "SELL"):
+                await notifier.send_trade(
+                    symbol=symbol,
+                    action=action,
+                    qty=float(decision.get("quantity", 1)),
+                    price=float(decision.get("target_price", 0)),
+                    confidence=confidence,
+                    strategy=decision.get("strategy_name", ""),
+                    reasoning=decision.get("reasoning", ""),
+                    stop_loss=float(decision.get("stop_loss", 0)),
+                    take_profit=float(decision.get("take_profit", 0)),
+                )
+            elif not risk_passed and action in ("BUY", "SELL"):
+                await notifier.send_risk_blocked(
+                    symbol=symbol,
+                    action=action,
+                    confidence=confidence,
+                    reason=result.get("risk_reason", "unknown"),
+                )
+            else:
+                await notifier.send_cycle_summary(
+                    symbol=symbol,
+                    signals=result.get("signals", {}),
+                    portfolio=result.get("portfolio", {}),
+                    action=action,
+                )
+
     except Exception as exc:
         logger.error(f"Agent cycle failed for {symbol}: {exc}", exc_info=True)
+        if notifier:
+            await notifier.send_error(symbol, str(exc))
         return
 
     # Snapshot portfolio to SQLite after every cycle
@@ -102,6 +139,9 @@ async def main() -> None:
 
     # SQLite
     init_db()
+
+    # Telegram notifier (optional — disabled if env vars not set)
+    notifier = TelegramNotifier.from_env()
 
     # Broker client initialisation
     if BROKER == "oanda":
@@ -136,11 +176,14 @@ async def main() -> None:
 
         graph = create_graph(checkpointer, db_pool, client)
 
+        if notifier:
+            await notifier.send_startup(BROKER, SYMBOLS)
+
         try:
             while True:
                 for symbol in SYMBOLS:
                     config = {"configurable": {"thread_id": f"trading-{BROKER}-{symbol}"}}
-                    await run_agent_cycle(graph, symbol, config, client)
+                    await run_agent_cycle(graph, symbol, config, client, notifier)
 
                 logger.info(f"Sleeping {RUN_INTERVAL_SECONDS}s until next cycle...")
                 await asyncio.sleep(RUN_INTERVAL_SECONDS)

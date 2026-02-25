@@ -82,8 +82,10 @@ class OandaClient:
         env_str = os.getenv("OANDA_ENV", "practice").lower()
         env = Environment.LIVE if env_str == "live" else Environment.PRACTICE
 
-        api_key = os.environ["OANDA_API_KEY"]
-        account_id = os.getenv("OANDA_ACCOUNT_ID", "")
+        api_key = os.getenv("OANDA_API_KEY", "").strip()
+        if not api_key:
+            raise ValueError("OANDA_API_KEY is not set. Add your Personal Access Token to .env")
+        account_id = os.getenv("OANDA_ACCOUNT_ID", "").strip()
 
         client = cls(env)
         await client.login(api_key, account_id)
