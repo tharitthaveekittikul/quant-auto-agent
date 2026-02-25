@@ -23,4 +23,5 @@ dependencies = [
     "signalrcore>=1.0.1",
     "sqlmodel>=0.0.37",
     "websockets>=16.0",
+    "yfinance>=1.2.0",
 ]

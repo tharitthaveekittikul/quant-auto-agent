@@ -22,8 +22,8 @@ class TradingDecision(BaseModel):
 class AgentState(TypedDict):
     # --- Identity ---
     symbol: str
-    broker: Literal["alpaca", "projectx"]
-    account_id: int | None  # required for projectx, None for alpaca
+    broker: Literal["alpaca", "projectx", "yfinance"]
+    account_id: int | None  # required for projectx, None for alpaca/yfinance
 
     # --- market_reader output ---
     market_data: list[dict]   # raw OHLCV bars [{t, o, h, l, c, v}]

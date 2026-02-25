@@ -32,7 +32,7 @@ def route_after_guardrail(state: AgentState) -> Literal["execution", "__end__"]:
 
 def create_graph(
     checkpointer: "BaseCheckpointSaver",
-    db_pool: "asyncpg.Pool",
+    db_pool: "asyncpg.Pool | None",
     broker_client: Any,
 ):
     """

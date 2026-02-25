@@ -41,7 +41,9 @@ LIMIT 100
 """.strip()
 
 
-async def _fetch_bars_questdb(db_pool: "asyncpg.Pool", symbol: str) -> list[dict]:
+async def _fetch_bars_questdb(db_pool: "asyncpg.Pool | None", symbol: str) -> list[dict]:
+    if db_pool is None:
+        return []
     query = _OHLCV_QUERY.format(
         lookback=OHLCV_LOOKBACK_HOURS,
         interval=OHLCV_SAMPLE_INTERVAL,
@@ -224,14 +226,17 @@ async def market_reader(state: dict, *, db_pool: "asyncpg.Pool", broker_client: 
 
     logger.info(f"[market_reader] Fetching data for {symbol} via {broker}")
 
-    # 1. Fetch bars (QuestDB first, REST fallback)
-    bars = await _fetch_bars_questdb(db_pool, symbol)
-    if len(bars) < MIN_BARS_REQUIRED:
-        logger.info(f"[market_reader] Insufficient QuestDB bars ({len(bars)}), using REST fallback")
-        if broker == "alpaca":
-            bars = await _fetch_bars_alpaca(broker_client, symbol)
-        else:
-            bars = await _fetch_bars_projectx(broker_client, symbol)
+    # 1. Fetch bars (yfinance skips QuestDB entirely; others try QuestDB first)
+    if broker == "yfinance":
+        bars = await broker_client.get_bars(symbol, interval="5m", lookback_days=5)
+    else:
+        bars = await _fetch_bars_questdb(db_pool, symbol)
+        if len(bars) < MIN_BARS_REQUIRED:
+            logger.info(f"[market_reader] Insufficient QuestDB bars ({len(bars)}), using REST fallback")
+            if broker == "alpaca":
+                bars = await _fetch_bars_alpaca(broker_client, symbol)
+            else:
+                bars = await _fetch_bars_projectx(broker_client, symbol)
 
     if not bars:
         logger.warning(f"[market_reader] No bars available for {symbol}")
@@ -248,7 +253,11 @@ async def market_reader(state: dict, *, db_pool: "asyncpg.Pool", broker_client: 
 
     # 3. Fetch portfolio
     try:
-        if broker == "alpaca":
+        if broker == "yfinance":
+            account = await broker_client.get_account()
+            positions = broker_client.get_all_positions()
+            portfolio = {**account, "positions": positions}
+        elif broker == "alpaca":
             portfolio = await _fetch_portfolio_alpaca(broker_client)
         else:
             portfolio = await _fetch_portfolio_projectx(broker_client, account_id)

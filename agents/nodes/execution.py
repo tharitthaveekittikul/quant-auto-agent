@@ -9,7 +9,7 @@ from typing import Any
 from langchain_core.messages import AIMessage
 from loguru import logger
 
-from shared.database import log_trade_to_db
+from shared.database import log_trade_to_db, log_trade_log_to_db
 
 
 async def execution(state: dict, *, broker_client: Any) -> dict:
@@ -30,7 +30,7 @@ async def execution(state: dict, *, broker_client: Any) -> dict:
     order_result: dict = {}
 
     try:
-        if broker == "alpaca":
+        if broker in ("alpaca", "yfinance"):
             if action == "BUY":
                 order_result = await broker_client.buy(symbol, qty=quantity, order_type="market")
             else:
@@ -56,7 +56,11 @@ async def execution(state: dict, *, broker_client: Any) -> dict:
             "messages": [AIMessage(content=f"Order failed: {exc}")],
         }
 
-    # Log to SQLite
+    # Actual fill price from broker (yfinance returns filled_avg_price)
+    fill_price = float(order_result.get("filled_avg_price", decision.get("target_price", 0)))
+    pnl = order_result.get("pnl")  # only present on SELL from yfinance
+
+    # Log to SQLite — TradeOrder (decision record)
     try:
         order_id = str(order_result.get("id", ""))
         log_trade_to_db(
@@ -68,16 +72,35 @@ async def execution(state: dict, *, broker_client: Any) -> dict:
                 "order_type": "market",
                 "strategy_name": decision.get("strategy_name", ""),
                 "confidence": float(decision.get("confidence", 0)),
-                "target_price": float(decision.get("target_price", 0)),
+                "target_price": fill_price,          # actual fill, not LLM suggestion
                 "stop_loss": float(decision.get("stop_loss", 0)),
                 "take_profit": float(decision.get("take_profit", 0)),
                 "order_id": order_id,
-                "status": "submitted",
+                "status": "filled",
                 "reasoning": decision.get("reasoning", ""),
             }
         )
     except Exception as exc:
-        logger.error(f"[execution] SQLite log failed: {exc}")
+        logger.error(f"[execution] TradeOrder log failed: {exc}")
+
+    # Log to SQLite — TradeLog (execution record with P&L)
+    try:
+        log_trade_log_to_db(
+            {
+                "broker": broker,
+                "symbol": symbol,
+                "action": action,
+                "quantity": quantity,
+                "fill_price": fill_price,
+                "pnl": pnl,
+                "strategy_name": decision.get("strategy_name", ""),
+                "order_id": order_id,
+            }
+        )
+        if pnl is not None:
+            logger.info(f"[execution] P&L: {'profit' if pnl >= 0 else 'loss'} ${pnl:+.2f}")
+    except Exception as exc:
+        logger.error(f"[execution] TradeLog log failed: {exc}")
 
     msg = AIMessage(
         content=(

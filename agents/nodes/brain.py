@@ -13,6 +13,32 @@ from core.constants import BRAIN_MODEL_ENV, DEFAULT_BRAIN_MODEL
 from core.state import TradingDecision
 from utils.llm import get_llm
 
+# Context injected into the prompt so the LLM knows units and instrument type
+_SYMBOL_CONTEXT: dict[str, str] = {
+    "XAUUSD": (
+        "Gold (XAU/USD) futures — priced in USD per troy ounce (see current_price in signals). "
+        "Quantity = troy ounces. "
+        "Example: at $5000/oz, buying 1 oz costs $5000; 0.1 oz costs $500. "
+        "Scale quantity so position value stays within 10% of equity."
+    ),
+    "XAGUSD": (
+        "Silver (XAG) priced in USD per troy ounce. "
+        "Quantity = troy ounces."
+    ),
+    "AUDUSD": (
+        "Australian Dollar / US Dollar forex pair. "
+        "Quantity = AUD units (not full lots). Use small quantities e.g. 100–1000 AUD."
+    ),
+    "EURUSD": (
+        "Euro / US Dollar forex pair. "
+        "Quantity = EUR units. Use small quantities e.g. 100–1000 EUR."
+    ),
+    "GBPJPY": (
+        "British Pound / Japanese Yen forex pair. "
+        "Quantity = GBP units. Use small quantities e.g. 100–1000 GBP."
+    ),
+}
+
 _SYSTEM_PROMPT = """You are an expert quantitative trading AI with a risk-first philosophy.
 Your role is to analyze technical signals and portfolio state to produce precise trading decisions.
 
@@ -89,7 +115,10 @@ async def brain(state: dict) -> dict:
             role = type(m).__name__.replace("Message", "").lower()
             recent_msgs.append(f"{role}: {m.content}")
 
-    human_content = f"""Symbol: {symbol}
+    instrument_ctx = _SYMBOL_CONTEXT.get(symbol.upper(), f"Symbol: {symbol}")
+
+    human_content = f"""Instrument: {symbol}
+Instrument context: {instrument_ctx}
 
 Technical Signals:
 {signals_str}
@@ -98,7 +127,7 @@ Portfolio: {portfolio_summary}
 
 {"Recent context:" + chr(10) + chr(10).join(recent_msgs) if recent_msgs else ""}
 
-Based on the signals above, provide a trading decision for {symbol}."""
+Based on the signals above, provide a trading decision for {symbol}. Pay attention to the instrument context when choosing quantity."""
 
     llm = get_llm(BRAIN_MODEL_ENV, DEFAULT_BRAIN_MODEL)
     structured_llm = llm.with_structured_output(TradingDecision, method="json_schema")
