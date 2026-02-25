@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 from langgraph.checkpoint.redis.aio import AsyncRedisSaver
 from loguru import logger
 
+from adapters.oanda.client import OandaClient
 from adapters.yfinance_client import YFinanceClient
 from core.constants import DEFAULT_REDIS_URL, PG_DATABASE, PG_HOST, PG_PASSWORD, PG_PORT, PG_USER
 from core.graph import create_graph
@@ -29,8 +30,8 @@ from utils.logger import setup_logger
 # Configuration
 # ---------------------------------------------------------------------------
 
-SYMBOLS = ["XAUUSD"]       # Focus on Gold for now
-BROKER = "yfinance"        # Paper trading via Yahoo Finance
+SYMBOLS = ["XAU_USD"]       # Focus on Gold for now
+BROKER = "oanda"        # Paper trading via Yahoo Finance
 STARTING_CAPITAL = 100_000.0
 RUN_INTERVAL_SECONDS = 300  # 5 minutes
 
@@ -102,9 +103,15 @@ async def main() -> None:
     # SQLite
     init_db()
 
-    # YFinance paper trading client (no credentials needed)
-    client = YFinanceClient(starting_capital=STARTING_CAPITAL)
-    await client.connect_market(SYMBOLS)
+    # Broker client initialisation
+    if BROKER == "oanda":
+        client = await OandaClient.from_env()
+        await client.connect_market(SYMBOLS)
+        await client.connect_user()
+    else:
+        # YFinance paper trading client (no credentials needed)
+        client = YFinanceClient(starting_capital=STARTING_CAPITAL)
+        await client.connect_market(SYMBOLS)
 
     # asyncpg pool → QuestDB (used as cache; yfinance broker bypasses it)
     redis_url = os.getenv("REDIS_URL", DEFAULT_REDIS_URL)

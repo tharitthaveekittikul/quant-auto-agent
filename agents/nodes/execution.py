@@ -30,7 +30,7 @@ async def execution(state: dict, *, broker_client: Any) -> dict:
     order_result: dict = {}
 
     try:
-        if broker in ("alpaca", "yfinance"):
+        if broker in ("alpaca", "yfinance", "oanda"):
             if action == "BUY":
                 order_result = await broker_client.buy(symbol, qty=quantity, order_type="market")
             else:

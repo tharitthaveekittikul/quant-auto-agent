@@ -22,7 +22,7 @@ class TradingDecision(BaseModel):
 class AgentState(TypedDict):
     # --- Identity ---
     symbol: str
-    broker: Literal["alpaca", "projectx", "yfinance"]
+    broker: Literal["alpaca", "projectx", "yfinance", "oanda"]
     account_id: int | None  # required for projectx, None for alpaca/yfinance
 
     # --- market_reader output ---

@@ -190,6 +190,41 @@ await client.buy("SPY", qty=1)                     # market order
 await client.rest.place_limit_order("AAPL", qty=5, side="sell", limit_price=200.0)
 ```
 
+### adapters/oanda/ — OANDA v20 Forex/Metals Client
+
+Supports forex pairs (EUR_USD, GBP_JPY) and metals (XAU_USD gold, XAG_USD silver) on OANDA's fxpractice or live environment.
+
+| File | Purpose |
+|------|---------|
+| `config.py` | `Environment` enum (PRACTICE/LIVE); `OandaConfig` frozen dataclass; `OANDA_CONFIGS` dict |
+| `rest_client.py` | `RestClient` — async `httpx.AsyncClient` wrapper for all v20 REST endpoints |
+| `market_stream.py` | `MarketStream` — chunked HTTP pricing stream → QuestDB; runs as asyncio.Task |
+| `trade_stream.py` | `TradeStream` — chunked HTTP transaction stream; fires `on_order` callback |
+| `client.py` | `OandaClient` — unified facade mirroring AlpacaClient interface |
+
+**Auth:** Personal Access Token (Bearer) — no login/refresh flow.
+
+**Streaming transport:** `httpx` async chunked HTTP (not WebSocket/SignalR). Auto-reconnects with exponential backoff.
+
+**Units convention:** Positive string = buy, negative = sell (e.g. `"100"` or `"-100"`). All price/units in request bodies are strings per OANDA spec.
+
+**Quick start:**
+```python
+client = await OandaClient.from_env()              # reads OANDA_ENV/API_KEY/ACCOUNT_ID
+account = await client.rest.get_account(client.account_id)
+await client.connect_market(["XAU_USD", "EUR_USD"])  # streams prices → QuestDB
+await client.connect_user(on_order=handler)          # order fill events
+await client.buy("XAU_USD", qty=1)                   # market order (1 unit)
+await client.sell("EUR_USD", qty=10000)              # market order
+```
+
+**Environment variables:**
+```
+OANDA_ENV=practice           # "practice" or "live"
+OANDA_API_KEY=               # Personal Access Token from OANDA AMP
+OANDA_ACCOUNT_ID=            # optional; auto-fetched from /v3/accounts if absent
+```
+
 ### Databases
 
 | Database | Purpose | Access |
@@ -218,6 +253,9 @@ OPENAI_API_KEY=
 GOOGLE_API_KEY=
 BRAIN_MODEL=claude-opus-4-6   # or gpt-4o or gemini-2.0-flash
 TELEGRAM_BOT_TOKEN=
+OANDA_ENV=practice           # "practice" or "live"
+OANDA_API_KEY=               # Personal Access Token from OANDA AMP
+OANDA_ACCOUNT_ID=            # optional; auto-fetched from /v3/accounts if absent
 ```
 
 ### Known Behaviours

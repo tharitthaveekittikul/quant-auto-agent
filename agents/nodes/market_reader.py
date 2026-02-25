@@ -116,6 +116,32 @@ async def _fetch_bars_alpaca(broker_client: Any, symbol: str) -> list[dict]:
         return []
 
 
+async def _fetch_bars_oanda(broker_client: Any, symbol: str) -> list[dict]:
+    """Use OANDA REST candles as fallback (granularity=M5, count=100, price=M)."""
+    try:
+        raw = await broker_client.rest.get_candles(symbol, granularity="M5", count=100)
+        bars = []
+        for c in raw:
+            mid = c.get("mid", {})
+            bars.append(
+                {
+                    "t": c.get("time", ""),
+                    "o": float(mid.get("o", 0)),
+                    "h": float(mid.get("h", 0)),
+                    "l": float(mid.get("l", 0)),
+                    "c": float(mid.get("c", 0)),
+                    "v": float(c.get("volume", 0)),
+                    "bid": float(mid.get("c", 0)),
+                    "ask": float(mid.get("c", 0)),
+                }
+            )
+        logger.info(f"[market_reader] OANDA REST fallback: {len(bars)} bars for {symbol}")
+        return bars
+    except Exception as exc:
+        logger.error(f"[market_reader] OANDA REST fallback failed: {exc}")
+        return []
+
+
 async def _fetch_bars_projectx(broker_client: Any, symbol: str) -> list[dict]:
     """Use ProjectX REST get_bars as fallback."""
     try:
@@ -185,6 +211,10 @@ async def _fetch_portfolio_alpaca(broker_client: Any) -> dict:
     }
 
 
+async def _fetch_portfolio_oanda(broker_client: Any) -> dict:
+    return await broker_client.rest.get_portfolio(broker_client.account_id)
+
+
 async def _fetch_portfolio_projectx(broker_client: Any, account_id: int) -> dict:
     accounts = await broker_client.rest.search_accounts()
     acc = next((a for a in accounts if a.get("id") == account_id), accounts[0] if accounts else {})
@@ -235,6 +265,8 @@ async def market_reader(state: dict, *, db_pool: "asyncpg.Pool", broker_client: 
             logger.info(f"[market_reader] Insufficient QuestDB bars ({len(bars)}), using REST fallback")
             if broker == "alpaca":
                 bars = await _fetch_bars_alpaca(broker_client, symbol)
+            elif broker == "oanda":
+                bars = await _fetch_bars_oanda(broker_client, symbol)
             else:
                 bars = await _fetch_bars_projectx(broker_client, symbol)
 
@@ -259,6 +291,8 @@ async def market_reader(state: dict, *, db_pool: "asyncpg.Pool", broker_client: 
             portfolio = {**account, "positions": positions}
         elif broker == "alpaca":
             portfolio = await _fetch_portfolio_alpaca(broker_client)
+        elif broker == "oanda":
+            portfolio = await _fetch_portfolio_oanda(broker_client)
         else:
             portfolio = await _fetch_portfolio_projectx(broker_client, account_id)
         logger.debug(f"[market_reader] Portfolio equity={portfolio['equity']:.2f}")
